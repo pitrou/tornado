@@ -29,6 +29,7 @@ from __future__ import absolute_import, division, print_function
 import collections
 import errno
 import numbers
+import io
 import os
 import socket
 import sys
@@ -118,6 +119,10 @@ class StreamBufferFullError(Exception):
     """
 
 
+_LARGE_BUF_THRESHOLD = 8192
+#_LARGE_BUF_THRESHOLD = 7
+
+
 class StreamBuffer(object):
 
     def __init__(self):
@@ -130,19 +135,15 @@ class StreamBuffer(object):
     def __len__(self):
         return self._size
 
-    _large_buf_threshold = 1024
-    #_large_buf_threshold = 2**48  # disable
-    #_large_buf_threshold = 7
-
     def extend(self, args):
         size = sum(map(len, args))
-        if size > self._large_buf_threshold:
+        if size > _LARGE_BUF_THRESHOLD:
             args = [memoryview(b) for b in args]
             self._buffers.extend([(True, b) for b in args if len(b)])
         elif size > 0:
             if self._buffers:
                 is_large, b = self._buffers[-1]
-                is_large = is_large or len(b) >= self._large_buf_threshold
+                is_large = is_large or len(b) >= _LARGE_BUF_THRESHOLD
             else:
                 is_large = True
             if is_large:
@@ -228,60 +229,175 @@ class StreamBuffer(object):
         self._first_pos = pos
         return b''.join(res)
 
-    def _coalesce(self, allow_offset=False):
-        buffers = self._buffers
-        pos = self._first_pos
+    #def _coalesce(self, allow_offset=False):
+        #buffers = self._buffers
+        #pos = self._first_pos
 
-        if ((allow_offset or pos == 0)
-            and len(buffers) == 1 and buffers[0][0] == False):
-            # Already coalesced
-            return
-        size = self._size
-        assert size > 0
-        assert len(buffers) > 0
+        #if ((allow_offset or pos == 0)
+            #and len(buffers) == 1 and buffers[0][0] == False):
+            ## Already coalesced
+            #return
+        #size = self._size
+        #assert size > 0
+        #assert len(buffers) > 0
 
-        is_large, b = buffers.popleft()
-        if is_large:
-            args = [b[pos:]]
+        #is_large, b = buffers.popleft()
+        #if is_large:
+            #args = [b[pos:]]
+        #else:
+            #args = [memoryview(b)[pos:]]
+        #args.extend([b for is_large, b in buffers])
+
+        #b = bytearray().join(args)
+        #assert len(b) == size
+        #buffers.clear()
+        #buffers.append((False, b))
+        #self._first_pos = 0
+
+    #def find(self, delim):
+        #if self._size == 0:
+            #return -1
+        #buffers = self._buffers
+
+        ## Relatively quick search in first buffer
+        #is_large, b = buffers[0]
+        #pos = self._first_pos
+        #if is_large:
+            #b = bytearray(b[pos:])
+            #buffers[0] = (False, b)
+            #self._first_pos = pos = 0
+
+        #r = b.find(delim, pos)
+        #if r >= 0:
+            #return r - pos
+        #if len(buffers) == 1:
+            #return -1
+
+        ## Save a bit of time by not looking again over the first bytes
+        #pos = len(b) - len(delim)
+        #self._coalesce(allow_offset=True)
+        #return buffers[0][1].find(delim, pos)
+
+    #def regex_search(self, pattern):
+        #if self._size == 0:
+            #return None
+        #self._coalesce()
+        #return pattern.search(self._buffers[0][1])
+
+
+_MINBUF = 8192
+
+
+class ReadNBytesLarge(object):
+
+    def __init__(self, leftover, nbytes, partial):
+        nleft = len(leftover)
+        self._buf = bytearray(nbytes)
+        if nleft <= nbytes:
+            self._buf[:nleft] = leftover
+            self._pos = nleft
+            self._leftover = memoryview(b'')
         else:
-            args = [memoryview(b)[pos:]]
-        args.extend([b for is_large, b in buffers])
+            # XXX is leftover already a memoryview?
+            self._buf[:] = memoryview(leftover)[:nbytes]
+            self._pos = nbytes
+            self._leftover = memoryview(leftover)[nbytes:]
+        self._partial = partial
+        self._nbytes = nbytes
 
-        b = bytearray().join(args)
-        assert len(b) == size
-        buffers.clear()
-        buffers.append((False, b))
-        self._first_pos = 0
+    def read_from_stream(self, stream):
+        pos = self._pos
+        buf = self._buf
+        nbytes = self._nbytes
 
-    def find(self, delim):
-        if self._size == 0:
-            return -1
-        buffers = self._buffers
+        while pos < nbytes:
+            got = stream._readinto(memoryview(buf)[pos:])
+            if not got:
+                self._pos = pos
+                if pos > 0 and self._partial:
+                    return memoryview(buf)[:pos], memoryview(b'')
+                else:
+                    return None
+            pos += got
 
-        # Relatively quick search in first buffer
-        is_large, b = buffers[0]
-        pos = self._first_pos
-        if is_large:
-            b = bytearray(b[pos:])
-            buffers[0] = (False, b)
-            self._first_pos = pos = 0
+        self._pos = pos
+        return buf, self._leftover
 
-        r = b.find(delim, pos)
-        if r >= 0:
-            return r - pos
-        if len(buffers) == 1:
-            return -1
 
-        # Save a bit of time by not looking again over the first bytes
-        pos = len(b) - len(delim)
-        self._coalesce(allow_offset=True)
-        return buffers[0][1].find(delim, pos)
+class ReadUntil(object):
 
-    def regex_search(self, pattern):
-        if self._size == 0:
-            return None
-        self._coalesce()
-        return pattern.search(self._buffers[0][1])
+    def __init__(self, leftover, delim, max_bytes):
+        nleft = len(leftover)
+        nbytes = max_bytes or max(nleft, _MINBUF)
+        self._buf = bytearray(nbytes)
+        #print("ReadUntil(delim=%r, max_bytes=%r, buf_size=%r, leftover=%r)"
+              #% (delim, max_bytes, nbytes, nleft))
+        if nleft <= nbytes:
+            self._buf[:nleft] = leftover
+            self._pos = nleft
+            self._leftover = memoryview(b'')
+        else:
+            # XXX is leftover already a memoryview?
+            self._buf[:] = memoryview(leftover)[:nbytes]
+            self._pos = nbytes
+            self._leftover = memoryview(leftover)[nbytes:]
+        self._delim = delim
+        self._max_bytes = max_bytes
+        self._last_search = -1
+
+    def read_from_stream(self, stream):
+        pos = self._pos
+        buf = self._buf
+        delim = self._delim
+        max_bytes = self._max_bytes
+        last_search = self._last_search
+
+        found = -1
+        if pos >= last_search * 2:
+            last_search = pos
+            found = buf.find(delim, 0, pos)
+
+        while found < 0 and (max_bytes is None or pos < max_bytes):
+            if max_bytes is None and pos * 2 >= len(buf):
+                buf.extend(b'x' * len(buf))
+            #print("reading up to %d bytes (pos=%d)" % (len(buf) - pos, pos))
+            got = stream._readinto(memoryview(buf)[pos:])
+            if not got:
+                #print("=> got nothing")
+                break
+            #print("=> got", got)
+            pos += got
+            if pos >= last_search * 2:
+                last_search = pos
+                found = buf.find(delim, 0, pos)
+
+        if found < 0 and pos > last_search:
+            last_search = pos
+            found = buf.find(delim, 0, pos)
+
+        self._pos = pos
+        self._last_search = last_search
+
+        if found >= 0:
+            found += len(delim)
+            leftover = memoryview(buf)[found:pos]
+            if self._leftover:
+                leftover = b''.join([leftover, self._leftover])
+            #print("found at %d (buf len = %d) => %d leftover bytes"
+                  #% (found, len(buf), len(leftover)))
+            return memoryview(buf)[:found], leftover
+
+        #print("couldn't find %r in %r (pos=%d, last search=%d)"
+              #% (delim, buf[:pos], pos, last_search))
+        self._check_max_bytes()
+
+    def _check_max_bytes(self):
+        #print("_check_max_bytes", self._pos, self._max_bytes)
+        if (self._max_bytes is not None and
+                self._pos >= self._max_bytes):
+            raise UnsatisfiableReadError(
+                "delimiter %r not found within %d bytes" % (
+                    self._delim, self._max_bytes))
 
 
 # FIXME: a decision must be made.  The StreamBuffer improves performance
@@ -335,12 +451,14 @@ class BaseIOStream(object):
                                    self.max_buffer_size // 2)
         self.max_write_buffer_size = max_write_buffer_size
         self.error = None
-        if USE_STREAM_BUFFER_FOR_READS:
-            self._read_buffer = StreamBuffer()
-        else:
-            self._read_buffer = bytearray()
-            self._read_buffer_pos = 0
-            self._read_buffer_size = 0
+        self._reader = None
+        self._read_leftover = b''
+        #if USE_STREAM_BUFFER_FOR_READS:
+            #self._read_buffer = StreamBuffer()
+        #else:
+            #self._read_buffer = bytearray()
+            #self._read_buffer_pos = 0
+            #self._read_buffer_size = 0
         self._write_buffer = StreamBuffer()
         self._write_buffer_frozen = False
         self._total_write_index = 0
@@ -459,8 +577,11 @@ class BaseIOStream(object):
             now optional and a `.Future` will be returned if it is omitted.
         """
         future = self._set_read_callback(callback)
-        self._read_delimiter = delimiter
-        self._read_max_bytes = max_bytes
+        assert self._reader is None
+        leftover, self._read_leftover = self._read_leftover, b''
+        self._reader = ReadUntil(leftover, delimiter, max_bytes)
+        #self._read_delimiter = delimiter
+        #self._read_max_bytes = max_bytes
         try:
             self._try_inline_read()
         except UnsatisfiableReadError as e:
@@ -493,9 +614,12 @@ class BaseIOStream(object):
         """
         future = self._set_read_callback(callback)
         assert isinstance(num_bytes, numbers.Integral)
-        self._read_bytes = num_bytes
-        self._read_partial = partial
-        self._streaming_callback = stack_context.wrap(streaming_callback)
+        assert self._reader is None
+        leftover, self._read_leftover = self._read_leftover, b''
+        self._reader = ReadNBytesLarge(leftover, num_bytes, partial)
+        #self._read_bytes = num_bytes
+        #self._read_partial = partial
+        #self._streaming_callback = stack_context.wrap(streaming_callback)
         try:
             self._try_inline_read()
         except:
@@ -504,46 +628,46 @@ class BaseIOStream(object):
             raise
         return future
 
-    def read_until_close(self, callback=None, streaming_callback=None):
-        """Asynchronously reads all data from the socket until it is closed.
+    #def read_until_close(self, callback=None, streaming_callback=None):
+        #"""Asynchronously reads all data from the socket until it is closed.
 
-        If a ``streaming_callback`` is given, it will be called with chunks
-        of data as they become available, and the final result will be empty.
-        Otherwise, the result is all the data that was read.
-        If a callback is given, it will be run with the data as an argument;
-        if not, this method returns a `.Future`.
+        #If a ``streaming_callback`` is given, it will be called with chunks
+        #of data as they become available, and the final result will be empty.
+        #Otherwise, the result is all the data that was read.
+        #If a callback is given, it will be run with the data as an argument;
+        #if not, this method returns a `.Future`.
 
-        Note that if a ``streaming_callback`` is used, data will be
-        read from the socket as quickly as it becomes available; there
-        is no way to apply backpressure or cancel the reads. If flow
-        control or cancellation are desired, use a loop with
-        `read_bytes(partial=True) <.read_bytes>` instead.
+        #Note that if a ``streaming_callback`` is used, data will be
+        #read from the socket as quickly as it becomes available; there
+        #is no way to apply backpressure or cancel the reads. If flow
+        #control or cancellation are desired, use a loop with
+        #`read_bytes(partial=True) <.read_bytes>` instead.
 
-        .. versionchanged:: 4.0
-            The callback argument is now optional and a `.Future` will
-            be returned if it is omitted.
+        #.. versionchanged:: 4.0
+            #The callback argument is now optional and a `.Future` will
+            #be returned if it is omitted.
 
-        """
-        future = self._set_read_callback(callback)
-        self._streaming_callback = stack_context.wrap(streaming_callback)
-        if self.closed():
-            if USE_STREAM_BUFFER_FOR_READS:
-                if self._streaming_callback is not None:
-                    self._run_read_callback(len(self._read_buffer), True)
-                self._run_read_callback(len(self._read_buffer), False)
-            else:
-                if self._streaming_callback is not None:
-                    self._run_read_callback(self._read_buffer_size, True)
-                self._run_read_callback(self._read_buffer_size, False)
-            return future
-        self._read_until_close = True
-        try:
-            self._try_inline_read()
-        except:
-            if future is not None:
-                future.add_done_callback(lambda f: f.exception())
-            raise
-        return future
+        #"""
+        #future = self._set_read_callback(callback)
+        #self._streaming_callback = stack_context.wrap(streaming_callback)
+        #if self.closed():
+            #if USE_STREAM_BUFFER_FOR_READS:
+                #if self._streaming_callback is not None:
+                    #self._run_read_callback(len(self._read_buffer), True)
+                #self._run_read_callback(len(self._read_buffer), False)
+            #else:
+                #if self._streaming_callback is not None:
+                    #self._run_read_callback(self._read_buffer_size, True)
+                #self._run_read_callback(self._read_buffer_size, False)
+            #return future
+        #self._read_until_close = True
+        #try:
+            #self._try_inline_read()
+        #except:
+            #if future is not None:
+                #future.add_done_callback(lambda f: f.exception())
+            #raise
+        #return future
 
     def write(self, data, callback=None):
         """Asynchronously write the given data to this stream.
@@ -616,15 +740,15 @@ class BaseIOStream(object):
                     exc_info = sys.exc_info()
                     if any(exc_info):
                         self.error = exc_info[1]
-            if self._read_until_close:
-                read_buffer_size = (len(self._read_buffer)
-                                    if USE_STREAM_BUFFER_FOR_READS
-                                    else self._read_buffer_size)
-                if (self._streaming_callback is not None and
-                        read_buffer_size):
-                    self._run_read_callback(read_buffer_size, True)
-                self._read_until_close = False
-                self._run_read_callback(read_buffer_size, False)
+            #if self._read_until_close:
+                #read_buffer_size = (len(self._read_buffer)
+                                    #if USE_STREAM_BUFFER_FOR_READS
+                                    #else self._read_buffer_size)
+                #if (self._streaming_callback is not None and
+                        #read_buffer_size):
+                    #self._run_read_callback(read_buffer_size, True)
+                #self._read_until_close = False
+                #self._run_read_callback(read_buffer_size, False)
             if self._state is not None:
                 self.io_loop.remove_handler(self.fileno())
                 self._state = None
@@ -663,7 +787,8 @@ class BaseIOStream(object):
 
     def reading(self):
         """Returns true if we are currently reading from the stream."""
-        return self._read_callback is not None or self._read_future is not None
+        return self._reader is not None
+        #return self._read_callback is not None or self._read_future is not None
 
     def writing(self):
         """Returns true if we are currently writing to the stream."""
@@ -721,13 +846,13 @@ class BaseIOStream(object):
                 state |= self.io_loop.READ
             if self.writing():
                 state |= self.io_loop.WRITE
+            #if (state == self.io_loop.ERROR and
+                #(len(self._read_buffer) if USE_STREAM_BUFFER_FOR_READS
+                 #else self._read_buffer_size) == 0):
             if (state == self.io_loop.ERROR and
-                (len(self._read_buffer) if USE_STREAM_BUFFER_FOR_READS
-                 else self._read_buffer_size) == 0):
+                self._close_callback is not None):
                 # If the connection is idle, listen for reads too so
-                # we can tell if the connection is closed.  If there is
-                # data in the read buffer we won't run the close callback
-                # yet anyway, so we don't need to listen in this case.
+                # we can tell if the connection is closed.
                 state |= self.io_loop.READ
             if state != self._state:
                 assert self._state is not None, \
@@ -778,81 +903,112 @@ class BaseIOStream(object):
             self._pending_callbacks += 1
             self.io_loop.add_callback(wrapper)
 
-    def _read_to_buffer_loop(self):
-        # This method is called from _handle_read and _try_inline_read.
-        try:
-            if self._read_bytes is not None:
-                target_bytes = self._read_bytes
-            elif self._read_max_bytes is not None:
-                target_bytes = self._read_max_bytes
-            elif self.reading():
-                # For read_until without max_bytes, or
-                # read_until_close, read as much as we can before
-                # scanning for the delimiter.
-                target_bytes = None
-            else:
-                target_bytes = 0
-            next_find_pos = 0
-            # Pretend to have a pending callback so that an EOF in
-            # _read_to_buffer doesn't trigger an immediate close
-            # callback.  At the end of this method we'll either
-            # establish a real pending callback via
-            # _read_from_buffer or run the close callback.
-            #
-            # We need two try statements here so that
-            # pending_callbacks is decremented before the `except`
-            # clause below (which calls `close` and does need to
-            # trigger the callback)
-            self._pending_callbacks += 1
-            while not self.closed():
-                # Read from the socket until we get EWOULDBLOCK or equivalent.
-                # SSL sockets do some internal buffering, and if the data is
-                # sitting in the SSL object's buffer select() and friends
-                # can't see it; the only way to find out if it's there is to
-                # try to read it.
-                if self._read_to_buffer() == 0:
-                    break
+    #def _read_to_buffer_loop(self):
+        ## This method is called from _handle_read and _try_inline_read.
+        #try:
+            #if self._read_bytes is not None:
+                #target_bytes = self._read_bytes
+            #elif self._read_max_bytes is not None:
+                #target_bytes = self._read_max_bytes
+            #elif self.reading():
+                ## For read_until without max_bytes, or
+                ## read_until_close, read as much as we can before
+                ## scanning for the delimiter.
+                #target_bytes = None
+            #else:
+                #target_bytes = 0
+            #next_find_pos = 0
+            ## Pretend to have a pending callback so that an EOF in
+            ## _read_to_buffer doesn't trigger an immediate close
+            ## callback.  At the end of this method we'll either
+            ## establish a real pending callback via
+            ## _read_from_buffer or run the close callback.
+            ##
+            ## We need two try statements here so that
+            ## pending_callbacks is decremented before the `except`
+            ## clause below (which calls `close` and does need to
+            ## trigger the callback)
+            #self._pending_callbacks += 1
+            #while not self.closed():
+                ## Read from the socket until we get EWOULDBLOCK or equivalent.
+                ## SSL sockets do some internal buffering, and if the data is
+                ## sitting in the SSL object's buffer select() and friends
+                ## can't see it; the only way to find out if it's there is to
+                ## try to read it.
+                #if self._read_to_buffer() == 0:
+                    #break
 
-                self._run_streaming_callback()
+                #self._run_streaming_callback()
 
-                # If we've read all the bytes we can use, break out of
-                # this loop.  We can't just call read_from_buffer here
-                # because of subtle interactions with the
-                # pending_callback and error_listener mechanisms.
-                #
-                # If we've reached target_bytes, we know we're done.
-                read_buffer_size = (len(self._read_buffer)
-                                    if USE_STREAM_BUFFER_FOR_READS
-                                    else self._read_buffer_size)
-                if (target_bytes is not None and
-                        read_buffer_size >= target_bytes):
-                    break
+                ## If we've read all the bytes we can use, break out of
+                ## this loop.  We can't just call read_from_buffer here
+                ## because of subtle interactions with the
+                ## pending_callback and error_listener mechanisms.
+                ##
+                ## If we've reached target_bytes, we know we're done.
+                #read_buffer_size = (len(self._read_buffer)
+                                    #if USE_STREAM_BUFFER_FOR_READS
+                                    #else self._read_buffer_size)
+                #if (target_bytes is not None and
+                        #read_buffer_size >= target_bytes):
+                    #break
 
-                # Otherwise, we need to call the more expensive find_read_pos.
-                # It's inefficient to do this on every read, so instead
-                # do it on the first read and whenever the read buffer
-                # size has doubled.
-                if read_buffer_size >= next_find_pos:
-                    pos = self._find_read_pos()
-                    if pos is not None:
-                        return pos
-                    next_find_pos = read_buffer_size * 2
-            return self._find_read_pos()
-        finally:
-            self._pending_callbacks -= 1
+                ## Otherwise, we need to call the more expensive find_read_pos.
+                ## It's inefficient to do this on every read, so instead
+                ## do it on the first read and whenever the read buffer
+                ## size has doubled.
+                #if read_buffer_size >= next_find_pos:
+                    #pos = self._find_read_pos()
+                    #if pos is not None:
+                        #return pos
+                    #next_find_pos = read_buffer_size * 2
+            #return self._find_read_pos()
+        #finally:
+            #self._pending_callbacks -= 1
+
+    def _readinto(self, mem):
+        while True:
+            try:
+                return self.readinto_from_fd(mem)
+            except (socket.error, IOError, OSError) as e:
+                if errno_from_exception(e) == errno.EINTR:
+                    continue
+                # ssl.SSLError is a subclass of socket.error
+                if self._is_connreset(e):
+                    # Treat ECONNRESET as a connection close rather than
+                    # an error to minimize log spam  (the exception will
+                    # be available on self.error for apps that care).
+                    self.close(exc_info=e)
+                    return
+                self.close(exc_info=e)
+                raise
+
+    def _handle_finished_read(self, got, leftover):
+        self._reader = None
+        self._read_leftover = leftover
+        # XXX wasteful
+        if isinstance(got, memoryview):
+            got = got.tobytes()
+        elif isinstance(got, bytearray):
+            got = bytes(got)
+        self._run_read_callback(got, False)
 
     def _handle_read(self):
+        reader = self._reader
+        if reader is None:
+            if not self.is_fd_connected():
+                self.close()
+            return
         try:
-            pos = self._read_to_buffer_loop()
+            r = reader.read_from_stream(self)
         except UnsatisfiableReadError:
             raise
         except Exception as e:
             gen_log.warning("error on read: %s" % e)
             self.close(exc_info=e)
             return
-        if pos is not None:
-            self._read_from_buffer(pos)
-            return
+        if r:
+            self._handle_finished_read(*r)
         else:
             self._maybe_run_close_callback()
 
@@ -865,8 +1021,9 @@ class BaseIOStream(object):
             self._read_future = TracebackFuture()
         return self._read_future
 
-    def _run_read_callback(self, size, streaming):
+    def _run_read_callback(self, data, streaming):
         if streaming:
+            1/0
             callback = self._streaming_callback
         else:
             callback = self._read_callback
@@ -875,10 +1032,10 @@ class BaseIOStream(object):
                 assert callback is None
                 future = self._read_future
                 self._read_future = None
-                future.set_result(self._consume(size))
+                future.set_result(data)
         if callback is not None:
             assert (self._read_future is None) or streaming
-            self._run_callback(callback, self._consume(size))
+            self._run_callback(callback, data)
         else:
             # If we scheduled a callback, we will add the error listener
             # afterwards.  If we didn't, we have to do it now.
@@ -892,144 +1049,158 @@ class BaseIOStream(object):
         listening for reads on the socket.
         """
         # See if we've already got the data from a previous read
-        self._run_streaming_callback()
-        pos = self._find_read_pos()
-        if pos is not None:
-            self._read_from_buffer(pos)
-            return
-        self._check_closed()
+        #self._run_streaming_callback()
         try:
-            pos = self._read_to_buffer_loop()
-        except Exception:
-            # If there was an in _read_to_buffer, we called close() already,
-            # but couldn't run the close callback because of _pending_callbacks.
-            # Before we escape from this function, run the close callback if
-            # applicable.
+            r = self._reader.read_from_stream(self)
+            if r:
+                self._handle_finished_read(*r)
+        except Exception as e:
+            self.close(exc_info=e)
             self._maybe_run_close_callback()
             raise
-        if pos is not None:
-            self._read_from_buffer(pos)
-            return
-        # We couldn't satisfy the read inline, so either close the stream
-        # or listen for new data.
+
         if self.closed():
             self._maybe_run_close_callback()
-        else:
+        elif self._reader is not None:
             self._add_io_state(ioloop.IOLoop.READ)
 
-    def _read_to_buffer(self):
-        """Reads from the socket and appends the result to the read buffer.
+        #pos = self._find_read_pos()
+        #if pos is not None:
+            #self._read_from_buffer(pos)
+            #return
+        #self._check_closed()
+        #try:
+            #pos = self._read_to_buffer_loop()
+        #except Exception:
+            ## If there was an in _read_to_buffer, we called close() already,
+            ## but couldn't run the close callback because of _pending_callbacks.
+            ## Before we escape from this function, run the close callback if
+            ## applicable.
+            #self._maybe_run_close_callback()
+            #raise
+        #if pos is not None:
+            #self._read_from_buffer(pos)
+            #return
+        ## We couldn't satisfy the read inline, so either close the stream
+        ## or listen for new data.
+        #if self.closed():
+            #self._maybe_run_close_callback()
+        #else:
+            #self._add_io_state(ioloop.IOLoop.READ)
 
-        Returns the number of bytes read.  Returns 0 if there is nothing
-        to read (i.e. the read returns EWOULDBLOCK or equivalent).  On
-        error closes the socket and raises an exception.
-        """
-        while True:
-            try:
-                chunk = self.read_from_fd()
-            except (socket.error, IOError, OSError) as e:
-                if errno_from_exception(e) == errno.EINTR:
-                    continue
-                # ssl.SSLError is a subclass of socket.error
-                if self._is_connreset(e):
-                    # Treat ECONNRESET as a connection close rather than
-                    # an error to minimize log spam  (the exception will
-                    # be available on self.error for apps that care).
-                    self.close(exc_info=e)
-                    return
-                self.close(exc_info=e)
-                raise
-            break
-        if chunk is None:
-            return 0
-        if USE_STREAM_BUFFER_FOR_READS:
-            self._read_buffer.extend([chunk])
-            read_buffer_size = len(self._read_buffer)
-        else:
-            self._read_buffer += chunk
-            self._read_buffer_size += len(chunk)
-            read_buffer_size = self._read_buffer_size
-        if read_buffer_size > self.max_buffer_size:
-            gen_log.error("Reached maximum read buffer size")
-            self.close()
-            raise StreamBufferFullError("Reached maximum read buffer size")
-        return len(chunk)
+    #def _read_to_buffer(self):
+        #"""Reads from the socket and appends the result to the read buffer.
 
-    def _run_streaming_callback(self):
-        bytes_to_consume = (len(self._read_buffer)
-                            if USE_STREAM_BUFFER_FOR_READS
-                            else self._read_buffer_size)
-        if self._streaming_callback is not None and bytes_to_consume:
-            if self._read_bytes is not None:
-                bytes_to_consume = min(self._read_bytes, bytes_to_consume)
-                self._read_bytes -= bytes_to_consume
-            self._run_read_callback(bytes_to_consume, True)
+        #Returns the number of bytes read.  Returns 0 if there is nothing
+        #to read (i.e. the read returns EWOULDBLOCK or equivalent).  On
+        #error closes the socket and raises an exception.
+        #"""
+        #while True:
+            #try:
+                #chunk = self.read_from_fd()
+            #except (socket.error, IOError, OSError) as e:
+                #if errno_from_exception(e) == errno.EINTR:
+                    #continue
+                ## ssl.SSLError is a subclass of socket.error
+                #if self._is_connreset(e):
+                    ## Treat ECONNRESET as a connection close rather than
+                    ## an error to minimize log spam  (the exception will
+                    ## be available on self.error for apps that care).
+                    #self.close(exc_info=e)
+                    #return
+                #self.close(exc_info=e)
+                #raise
+            #break
+        #if chunk is None:
+            #return 0
+        #if USE_STREAM_BUFFER_FOR_READS:
+            #self._read_buffer.extend([chunk])
+            #read_buffer_size = len(self._read_buffer)
+        #else:
+            #self._read_buffer += chunk
+            #self._read_buffer_size += len(chunk)
+            #read_buffer_size = self._read_buffer_size
+        #if read_buffer_size > self.max_buffer_size:
+            #gen_log.error("Reached maximum read buffer size")
+            #self.close()
+            #raise StreamBufferFullError("Reached maximum read buffer size")
+        #return len(chunk)
 
-    def _read_from_buffer(self, pos):
-        """Attempts to complete the currently-pending read from the buffer.
+    #def _run_streaming_callback(self):
+        #bytes_to_consume = (len(self._read_buffer)
+                            #if USE_STREAM_BUFFER_FOR_READS
+                            #else self._read_buffer_size)
+        #if self._streaming_callback is not None and bytes_to_consume:
+            #if self._read_bytes is not None:
+                #bytes_to_consume = min(self._read_bytes, bytes_to_consume)
+                #self._read_bytes -= bytes_to_consume
+            #self._run_read_callback(bytes_to_consume, True)
 
-        The argument is either a position in the read buffer or None,
-        as returned by _find_read_pos.
-        """
-        self._read_bytes = self._read_delimiter = self._read_regex = None
-        self._read_partial = False
-        self._run_read_callback(pos, False)
+    #def _read_from_buffer(self, pos):
+        #"""Attempts to complete the currently-pending read from the buffer.
 
-    def _find_read_pos(self):
-        """Attempts to find a position in the read buffer that satisfies
-        the currently-pending read.
+        #The argument is either a position in the read buffer or None,
+        #as returned by _find_read_pos.
+        #"""
+        #self._read_bytes = self._read_delimiter = self._read_regex = None
+        #self._read_partial = False
+        #self._run_read_callback(pos, False)
 
-        Returns a position in the buffer if the current read can be satisfied,
-        or None if it cannot.
-        """
-        read_buffer_size = (len(self._read_buffer)
-                            if USE_STREAM_BUFFER_FOR_READS
-                            else self._read_buffer_size)
-        if (self._read_bytes is not None and
-            (read_buffer_size >= self._read_bytes or
-             (self._read_partial and read_buffer_size > 0))):
-            num_bytes = min(self._read_bytes, read_buffer_size)
-            return num_bytes
-        elif self._read_delimiter is not None:
-            # Multi-byte delimiters (e.g. '\r\n') may straddle two
-            # chunks in the read buffer, so we can't easily find them
-            # without collapsing the buffer.  However, since protocols
-            # using delimited reads (as opposed to reads of a known
-            # length) tend to be "line" oriented, the delimiter is likely
-            # to be in the first few chunks.  Merge the buffer gradually
-            # since large merges are relatively expensive and get undone in
-            # _consume().
-            if self._read_buffer:
-                if USE_STREAM_BUFFER_FOR_READS:
-                    loc = self._read_buffer.find(self._read_delimiter)
-                else:
-                    loc = self._read_buffer.find(self._read_delimiter,
-                                                 self._read_buffer_pos)
-                if loc != -1:
-                    if not USE_STREAM_BUFFER_FOR_READS:
-                        loc -= self._read_buffer_pos
-                    delimiter_len = len(self._read_delimiter)
-                    self._check_max_bytes(self._read_delimiter,
-                                          loc + delimiter_len)
-                    return loc + delimiter_len
-                self._check_max_bytes(self._read_delimiter,
-                                      read_buffer_size)
-        elif self._read_regex is not None:
-            if self._read_buffer:
-                if USE_STREAM_BUFFER_FOR_READS:
-                    m = self._read_buffer.regex_search(self._read_regex)
-                else:
-                    m = self._read_regex.search(self._read_buffer,
-                                                self._read_buffer_pos)
-                if m is not None:
-                    if USE_STREAM_BUFFER_FOR_READS:
-                        loc = m.end()
-                    else:
-                        loc = m.end() - self._read_buffer_pos
-                    self._check_max_bytes(self._read_regex, loc)
-                    return loc
-                self._check_max_bytes(self._read_regex, read_buffer_size)
-        return None
+    #def _find_read_pos(self):
+        #"""Attempts to find a position in the read buffer that satisfies
+        #the currently-pending read.
+
+        #Returns a position in the buffer if the current read can be satisfied,
+        #or None if it cannot.
+        #"""
+        #read_buffer_size = (len(self._read_buffer)
+                            #if USE_STREAM_BUFFER_FOR_READS
+                            #else self._read_buffer_size)
+        #if (self._read_bytes is not None and
+            #(read_buffer_size >= self._read_bytes or
+             #(self._read_partial and read_buffer_size > 0))):
+            #num_bytes = min(self._read_bytes, read_buffer_size)
+            #return num_bytes
+        #elif self._read_delimiter is not None:
+            ## Multi-byte delimiters (e.g. '\r\n') may straddle two
+            ## chunks in the read buffer, so we can't easily find them
+            ## without collapsing the buffer.  However, since protocols
+            ## using delimited reads (as opposed to reads of a known
+            ## length) tend to be "line" oriented, the delimiter is likely
+            ## to be in the first few chunks.  Merge the buffer gradually
+            ## since large merges are relatively expensive and get undone in
+            ## _consume().
+            #if self._read_buffer:
+                #if USE_STREAM_BUFFER_FOR_READS:
+                    #loc = self._read_buffer.find(self._read_delimiter)
+                #else:
+                    #loc = self._read_buffer.find(self._read_delimiter,
+                                                 #self._read_buffer_pos)
+                #if loc != -1:
+                    #if not USE_STREAM_BUFFER_FOR_READS:
+                        #loc -= self._read_buffer_pos
+                    #delimiter_len = len(self._read_delimiter)
+                    #self._check_max_bytes(self._read_delimiter,
+                                          #loc + delimiter_len)
+                    #return loc + delimiter_len
+                #self._check_max_bytes(self._read_delimiter,
+                                      #read_buffer_size)
+        #elif self._read_regex is not None:
+            #if self._read_buffer:
+                #if USE_STREAM_BUFFER_FOR_READS:
+                    #m = self._read_buffer.regex_search(self._read_regex)
+                #else:
+                    #m = self._read_regex.search(self._read_buffer,
+                                                #self._read_buffer_pos)
+                #if m is not None:
+                    #if USE_STREAM_BUFFER_FOR_READS:
+                        #loc = m.end()
+                    #else:
+                        #loc = m.end() - self._read_buffer_pos
+                    #self._check_max_bytes(self._read_regex, loc)
+                    #return loc
+                #self._check_max_bytes(self._read_regex, read_buffer_size)
+        #return None
 
     def _check_max_bytes(self, delimiter, size):
         if (self._read_max_bytes is not None and
@@ -1071,7 +1242,7 @@ class BaseIOStream(object):
                     size = 128 * 1024
 
                 num_bytes = self.write_to_fd(self._write_buffer.peek(size))
-                if num_bytes == 0:
+                if not num_bytes:
                     self._got_empty_write(size)
                     break
                 self._write_buffer.skip(num_bytes)
@@ -1091,6 +1262,8 @@ class BaseIOStream(object):
                                         self.fileno(), e)
                     self.close(exc_info=e)
                     return
+            except Exception as e:
+                raise
 
         while self._write_futures:
             index, future = self._write_futures[0]
@@ -1106,28 +1279,28 @@ class BaseIOStream(object):
                 self._write_callback = None
                 self._run_callback(callback)
 
-    def _consume(self, loc):
-        # Consume loc bytes from the read buffer and return them
-        if loc == 0:
-            return b""
-        if USE_STREAM_BUFFER_FOR_READS:
-            assert loc <= len(self._read_buffer)
-            return self._read_buffer.read(loc)
-        else:
-            assert loc <= self._read_buffer_size
-            # Slice the bytearray buffer into bytes, without intermediate copying
-            b = (memoryview(self._read_buffer)
-                 [self._read_buffer_pos:self._read_buffer_pos + loc]
-                 ).tobytes()
-            self._read_buffer_pos += loc
-            self._read_buffer_size -= loc
-            # Amortized O(1) shrink
-            # (this heuristic is implemented natively in Python 3.4+
-            #  but is replicated here for Python 2)
-            if self._read_buffer_pos > self._read_buffer_size:
-                del self._read_buffer[:self._read_buffer_pos]
-                self._read_buffer_pos = 0
-            return b
+    #def _consume(self, loc):
+        ## Consume loc bytes from the read buffer and return them
+        #if loc == 0:
+            #return b""
+        #if USE_STREAM_BUFFER_FOR_READS:
+            #assert loc <= len(self._read_buffer)
+            #return self._read_buffer.read(loc)
+        #else:
+            #assert loc <= self._read_buffer_size
+            ## Slice the bytearray buffer into bytes, without intermediate copying
+            #b = (memoryview(self._read_buffer)
+                 #[self._read_buffer_pos:self._read_buffer_pos + loc]
+                 #).tobytes()
+            #self._read_buffer_pos += loc
+            #self._read_buffer_size -= loc
+            ## Amortized O(1) shrink
+            ## (this heuristic is implemented natively in Python 3.4+
+            ##  but is replicated here for Python 2)
+            #if self._read_buffer_pos > self._read_buffer_size:
+                #del self._read_buffer[:self._read_buffer_pos]
+                #self._read_buffer_pos = 0
+            #return b
 
     def _check_closed(self):
         if self.closed():
@@ -1145,7 +1318,7 @@ class BaseIOStream(object):
         if self._state is None or self._state == ioloop.IOLoop.ERROR:
             if self.closed():
                 self._maybe_run_close_callback()
-            elif (not self._read_buffer and
+            elif (self._reader is None and
                   self._close_callback is not None):
                 self._add_io_state(ioloop.IOLoop.READ)
 
@@ -1269,8 +1442,34 @@ class IOStream(BaseIOStream):
             return None
         return chunk
 
+    def readinto_from_fd(self, mem):
+        try:
+            nbytes = self.socket.recv_into(mem)
+        except socket.error as e:
+            if e.args[0] in _ERRNO_WOULDBLOCK:
+                return None
+            else:
+                raise
+        if not nbytes:
+            self.close()
+            return None
+        return nbytes
+
     def write_to_fd(self, data):
         return self.socket.send(data)
+
+    def is_fd_connected(self):
+        # Unfortunately, we cannot use send(b'') as that can succeed
+        # on a shutdown TCP socket.
+        try:
+            chunk = self.socket.recv(1, socket.MSG_PEEK)
+        except socket.error as e:
+            if e.args[0] in _ERRNO_WOULDBLOCK:
+                return False
+            else:
+                raise
+        # If recv() succeeded but returned 0 bytes, the connection has ended
+        return len(chunk) > 0
 
     def connect(self, address, callback=None, server_hostname=None):
         """Connects the socket to a remote address without blocking.
@@ -1710,6 +1909,41 @@ class SSLIOStream(IOStream):
             return None
         return chunk
 
+    def readinto_from_fd(self, mem):
+        if self._ssl_accepting:
+            # If the handshake hasn't finished yet, there can't be anything
+            # to read (attempting to read may or may not raise an exception
+            # depending on the SSL version)
+            return None
+        try:
+            nbytes = self.socket.recv_into(mem)
+        except ssl.SSLError as e:
+            # SSLError is a subclass of socket.error, so this except
+            # block must come first.
+            if e.args[0] == ssl.SSL_ERROR_WANT_READ:
+                return None
+            else:
+                raise
+        except socket.error as e:
+            if e.args[0] in _ERRNO_WOULDBLOCK:
+                return None
+            else:
+                raise
+        if not nbytes:
+            self.close()
+            return None
+        return nbytes
+
+    def is_fd_connected(self):
+        try:
+            res = self.socket.send(b'')
+        except (ssl.SSLError, socket.error) as e:
+            if self._is_connreset(e):
+                return None
+            else:
+                raise
+        return True
+
     def _is_connreset(self, e):
         if isinstance(e, ssl.SSLError) and e.args[0] == ssl.SSL_ERROR_EOF:
             return True
@@ -1727,6 +1961,7 @@ class PipeIOStream(BaseIOStream):
     def __init__(self, fd, *args, **kwargs):
         self.fd = fd
         _set_nonblocking(fd)
+        self._fileio = io.FileIO(fd, 'r+', closefd=False)
         super(PipeIOStream, self).__init__(*args, **kwargs)
 
     def fileno(self):
@@ -1736,25 +1971,65 @@ class PipeIOStream(BaseIOStream):
         os.close(self.fd)
 
     def write_to_fd(self, data):
-        return os.write(self.fd, data)
+        #return os.write(self.fd, data)
+        return self._fileio.write(data)
 
     def read_from_fd(self):
         try:
-            chunk = os.read(self.fd, self.read_chunk_size)
-        except (IOError, OSError) as e:
-            if errno_from_exception(e) in _ERRNO_WOULDBLOCK:
-                return None
-            elif errno_from_exception(e) == errno.EBADF:
+            chunk = self._fileio.read(self.read_chunk_size)
+        except EnvironmentError as e:
+            if errno_from_exception(e) == errno.EBADF:
                 # If the writing half of a pipe is closed, select will
                 # report it as readable but reads will fail with EBADF.
                 self.close(exc_info=e)
                 return None
             else:
                 raise
-        if not chunk:
+        if chunk is None:
+            # None means EWOULDBLOCK with FileIO
+            return None
+        elif not chunk:
             self.close()
             return None
         return chunk
+
+    def readinto_from_fd(self, mem):
+        try:
+            nbytes = self._fileio.readinto(mem)
+        except EnvironmentError as e:
+            if errno_from_exception(e) == errno.EBADF:
+                # If the writing half of a pipe is closed, select will
+                # report it as readable but reads will fail with EBADF.
+                self.close(exc_info=e)
+                return None
+            else:
+                raise
+        if nbytes is None:
+            # None means EWOULDBLOCK with FileIO
+            return None
+        elif nbytes == 0:
+            self.close()
+            return None
+        return nbytes
+
+    def is_fd_connected(self):
+        # XXX no clue
+        return True
+        #return self._fileio.read(0)
+        #try:
+            #res = self.socket.send(b'')
+        #except (ssl.SSLError, socket.error) as e:
+            #if self._is_connreset(e):
+                #return None
+            #else:
+                #raise
+        #return True
+
+    def _is_connreset(self, e):
+        if (isinstance(e, EnvironmentError)
+            and errno_from_exception(e) == errno.EBADF):
+            return True
+        return super(SSLIOStream, self)._is_connreset(e)
 
 
 def doctests():
